@@ -283,31 +283,25 @@ async function deviceBootstrap(): Promise<Stored> {
     const minutes = Math.round((dev.expires_in ?? 1800) / 60);
     const loginMessage = `🔐 Grok 云端需要登录\n点击链接登录并批准（验证码 ${dev.user_code}），${minutes} 分钟内有效：\n${link}`;
     log(`device code issued: ${dev.user_code} (attempt ${attempt}) — ${link}`);
-    // Each reissued code is a fresh link. Telegram keeps its cross-attempt
-    // delivery cursor; Weixin re-arms so the new link is (re)delivered once the
-    // account is linked.
-    if (CHANNEL === "weixin") linkSentAt = 0;
-    // Publish the prompt so the bridge can relay it on the operator's first
-    // message (Weixin rejects a proactive push before the user has messaged).
+    // Publish the prompt so the bridge can deliver it, and to record the current
+    // pending link.
     writePendingLogin(loginMessage);
-    await sendLink(loginMessage);
+    // Weixin delivery is owned by the bridge: it replies to the operator's
+    // message and relays on a no-credential 503. The oauth manager must NOT also
+    // push, or the operator gets the link twice (e.g. on /login, where the bot is
+    // already allowed to message them). Telegram is delivered here.
+    if (CHANNEL !== "weixin") {
+      await sendLink(loginMessage);
+    }
 
     let interval = (dev.interval ?? 5) * 1000;
     const deadline = nowSec() + (dev.expires_in ?? 1800);
     while (nowSec() < deadline) {
       await new Promise((r) => setTimeout(r, interval));
 
-      if (CHANNEL === "weixin") {
-        // Weixin can only push once the operator links the account, which may
-        // happen after the code is issued. Keep trying (cheap: a file read plus
-        // one send) until the link lands, then stop.
-        if (linkSentAt === 0) {
-          await sendLink(loginMessage);
-        }
-      } else {
-        // Reactive login link: the bridge isn't running yet, so if an approved
-        // user messages the bot while we wait for approval, resend the link
-        // (throttled) instead of leaving them in silence.
+      if (CHANNEL !== "weixin") {
+        // Reactive login link: if an approved telegram user messages the bot
+        // while we wait for approval, resend the link (throttled).
         const updates = await telegramGetUpdates(tgOffset);
         if (updates.length > 0) {
           tgOffset = updates[updates.length - 1].update_id + 1;
