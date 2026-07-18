@@ -2793,6 +2793,7 @@ function isAuthenticationError(error: unknown): boolean {
 const STATUS_MESSAGES: Record<number, string> = {
   400: "The request was invalid. This may be caused by an unsupported parameter or model.",
   401: "Authentication failed. Your API key may be invalid or expired.",
+  402: "Payment required. You may be out of credits or need an active subscription.",
   403: "Access denied. Your API key does not have permission for this request.",
   404: "The requested model or endpoint was not found. Check your model name and base URL.",
   408: "The request timed out. Please try again.",
@@ -2821,7 +2822,11 @@ function extractResponseDetail(body: string | undefined): string | null {
   if (!body) return null;
   try {
     const parsed = JSON.parse(body);
-    const msg = parsed?.error?.message ?? parsed?.message ?? parsed?.detail;
+    // xAI billing errors put the human text in a top-level string `error`
+    // (e.g. {"code":"...","error":"You have run out of credits ..."}), while
+    // other providers nest it under error.message — handle both shapes.
+    const err = parsed?.error;
+    const msg = (typeof err === "string" ? err : err?.message) ?? parsed?.message ?? parsed?.detail;
     if (typeof msg === "string" && msg.trim()) return msg.trim();
   } catch {
     /* not JSON */

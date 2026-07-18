@@ -236,19 +236,29 @@ async function handleChat(req: Request): Promise<Response> {
     });
   }
 
-  // Non-streaming: accumulate the assistant text.
+  // Non-streaming: accumulate the assistant text, and capture any error the
+  // agent emits (e.g. billing/quota) so callers get a real error instead of a
+  // misleading "(no text output)".
   return enqueue(sessionId, async () => {
     let text = "";
+    let errorText = "";
     try {
       const agent = getAgent(sessionId);
       for await (const chunk of agent.processMessage(prompt)) {
         if (chunk.type === "content" && chunk.content) text += chunk.content;
+        else if (chunk.type === "error" && chunk.content) errorText += chunk.content;
       }
     } catch (err) {
       return Response.json(
         { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
         { status: 502 },
       );
+    }
+    // The agent failed with no usable text (e.g. out of credits) — surface the
+    // error so the client can react (the bridge maps it to a billing notice)
+    // rather than returning an empty "(no text output)" completion.
+    if (!text && errorText) {
+      return Response.json({ error: { message: errorText, type: "server_error" } }, { status: 502 });
     }
     return Response.json({
       id,
