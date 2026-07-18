@@ -369,6 +369,20 @@ async function ensureToken(): Promise<Stored> {
 
 async function main(): Promise<void> {
   const cmd = process.argv[2] ?? "token";
+  if (cmd === "relogin") {
+    // On-demand re-login (operator sent /login). Run the device flow WITHOUT
+    // touching the current token — deviceBootstrap only overwrites the store on
+    // successful approval, so the current account keeps serving until then. It
+    // publishes the link via pending-login.json for the bridge to relay.
+    try {
+      await deviceBootstrap();
+      log("relogin: new account authorized (store overwritten)");
+    } catch (err) {
+      log(`relogin: not completed (${err instanceof Error ? err.message : String(err)}); current account unchanged`);
+      clearPendingLogin();
+    }
+    return;
+  }
   if (cmd !== "token") {
     log(`unknown command: ${cmd}`);
     process.exit(2);

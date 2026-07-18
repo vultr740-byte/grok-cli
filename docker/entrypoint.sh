@@ -41,17 +41,34 @@ if [ "$CHANNEL" = "weixin" ]; then
   trap weixin_cleanup EXIT INT TERM
 
   if [ "$AUTH_MODE" = "oauth" ]; then
-    # Keep the OAuth store fresh in the background. The first pass runs the device
-    # flow (blocking until the operator approves the logged link); the app-server
-    # reads the store live, so later refreshes never restart anything.
+    # Keep the OAuth store fresh in the background, and service on-demand /login
+    # re-logins. The first refresh runs the device flow (blocking until the
+    # operator approves the logged link); the app-server reads the store live, so
+    # later refreshes never restart anything.
+    RELOGIN_MARKER="${GROK_DIR}/relogin-request"
     (
+      relogin_pid=""
+      refresh_at=0
       while true; do
-        if ! bun docker/oauth.ts token >/dev/null; then
-          echo "[entrypoint] token acquisition failed; retrying in 30s"
-          sleep 30
-          continue
+        # /login: the bridge drops this marker to request a fresh device login.
+        # Run it non-destructively (it overwrites the store only on approval), one
+        # at a time.
+        if [ -f "$RELOGIN_MARKER" ] && { [ -z "$relogin_pid" ] || ! kill -0 "$relogin_pid" 2>/dev/null; }; then
+          rm -f "$RELOGIN_MARKER"
+          echo "[entrypoint] /login requested — starting a re-login device flow"
+          bun docker/oauth.ts relogin &
+          relogin_pid=$!
         fi
-        sleep 300
+        now="$(date +%s)"
+        if [ "$now" -ge "$refresh_at" ]; then
+          if bun docker/oauth.ts token >/dev/null; then
+            refresh_at=$(( now + 300 ))
+          else
+            echo "[entrypoint] token acquisition failed; retrying in 30s"
+            refresh_at=$(( now + 30 ))
+          fi
+        fi
+        sleep 3
       done
     ) &
     OAUTH_PID=$!

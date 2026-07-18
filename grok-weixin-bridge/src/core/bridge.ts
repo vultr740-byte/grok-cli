@@ -84,6 +84,16 @@ export class Bridge {
           this.dedup.add(messageId);
 
           const text = extractText(msg.item_list);
+          if (isLoginCommand(text)) {
+            await handleLoginCommand({
+              baseUrl,
+              token,
+              fromUserId,
+              operatorUserId: account?.userId ?? null,
+              contextToken: msg.context_token ?? null,
+            });
+            continue;
+          }
           const { attachments, errors: attachmentErrors } = await downloadInboundAttachments({
             items: msg.item_list,
             cdnBaseUrl: this.config.weixinCdnBaseUrl,
@@ -418,16 +428,88 @@ function isNoCredentialFailure(message: string): boolean {
   return normalized.includes("no xai credential") || (normalized.includes("503") && normalized.includes("credential"));
 }
 
+function grokHomeFile(name: string): string {
+  return path.join(process.env.HOME ?? "", ".grok", name);
+}
+
+function pendingLoginPath(): string {
+  return process.env.GROK_PENDING_LOGIN_FILE ?? grokHomeFile("pending-login.json");
+}
+
+function reloginMarkerPath(): string {
+  return process.env.GROK_RELOGIN_MARKER ?? grokHomeFile("relogin-request");
+}
+
 // The oauth manager writes the pending device-login prompt here while it waits
 // for approval; the bridge surfaces it to the first weixin message.
 function readPendingLoginMessage(): string | null {
-  const file = process.env.GROK_PENDING_LOGIN_FILE ?? path.join(process.env.HOME ?? "", ".grok", "pending-login.json");
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { message?: string };
+    const parsed = JSON.parse(fs.readFileSync(pendingLoginPath(), "utf8")) as { message?: string };
     return parsed.message?.trim() ? parsed.message : null;
   } catch {
     return null;
   }
+}
+
+const LOGIN_COMMAND = "/login";
+const RELOGIN_LINK_WAIT_MS = Number(process.env.GROK_RELOGIN_LINK_WAIT_MS ?? 25_000);
+
+function isLoginCommand(text: string): boolean {
+  return text.trim().toLowerCase() === LOGIN_COMMAND;
+}
+
+// /login: request a fresh device-login link and reply with it in the same turn.
+// Non-destructive — oauth re-runs the device flow and overwrites the stored
+// credential only on successful approval, so the current account keeps working
+// until then. It must be a reply (not a later push, which weixin blocks) and,
+// while the current token is valid, there is no no-credential 503 to piggyback
+// on — so the link is delivered here, in response to the /login message.
+async function handleLoginCommand(params: {
+  baseUrl: string;
+  token: string;
+  fromUserId: string;
+  operatorUserId: string | null;
+  contextToken: string | null;
+}): Promise<void> {
+  // Only the linked operator may re-auth the shared xAI credential — otherwise a
+  // stranger could approve with their own account and hijack the bot. When the
+  // operator id is unknown (not captured at login) we can't gate, so we allow it.
+  if (params.operatorUserId && params.fromUserId !== params.operatorUserId) {
+    console.warn(`Ignoring /login from non-operator ${params.fromUserId}`);
+    return;
+  }
+  const text = await requestReloginLink();
+  await sendTextMessage({
+    baseUrl: params.baseUrl,
+    token: params.token,
+    toUserId: params.fromUserId,
+    text,
+    contextToken: params.contextToken,
+  });
+}
+
+async function requestReloginLink(): Promise<string> {
+  // Drop any stale link, ask the oauth manager (via the marker the entrypoint
+  // watches) for a fresh device code, then wait for it to publish the new prompt.
+  try {
+    fs.rmSync(pendingLoginPath(), { force: true });
+  } catch {
+    /* best effort */
+  }
+  try {
+    const marker = reloginMarkerPath();
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, String(Date.now()));
+  } catch {
+    /* best effort */
+  }
+  const deadline = Date.now() + RELOGIN_LINK_WAIT_MS;
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    const message = readPendingLoginMessage();
+    if (message) return message;
+  }
+  return "⏳ 正在生成登录链接，请稍后再发一次 /login。";
 }
 
 function isBillingFailure(message: string): boolean {

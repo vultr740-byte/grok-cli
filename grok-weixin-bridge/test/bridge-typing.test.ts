@@ -1241,6 +1241,195 @@ test("bridge relays the pending login link when the app-server has no credential
   assert.doesNotMatch(sentText, /Grok 对话失败/);
 });
 
+function buildLoginCommandWeixinServer(
+  received: Array<{ endpoint: string; body: Record<string, unknown> }>,
+  fromUserId: string,
+): http.Server {
+  let getUpdatesCount = 0;
+  return http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      received.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(
+            JSON.stringify({
+              ret: 0,
+              get_updates_buf: "buf-1",
+              msgs: [
+                {
+                  message_id: "msg-1",
+                  from_user_id: fromUserId,
+                  context_token: "ctx-1",
+                  item_list: [{ type: 1, text_item: { text: "/login" } }],
+                },
+              ],
+            }),
+          );
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+}
+
+test("bridge answers /login with a fresh login link and runs no grok turn", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-weixin-bridge-"));
+  const marker = path.join(stateDir, "relogin-request");
+  const pendingFile = path.join(stateDir, "pending-login.json");
+  const loginLink = "https://accounts.x.ai/oauth2/device?user_code=NEW-CODE";
+  const prev = {
+    marker: process.env.GROK_RELOGIN_MARKER,
+    pending: process.env.GROK_PENDING_LOGIN_FILE,
+    wait: process.env.GROK_RELOGIN_LINK_WAIT_MS,
+  };
+  process.env.GROK_RELOGIN_MARKER = marker;
+  process.env.GROK_PENDING_LOGIN_FILE = pendingFile;
+  process.env.GROK_RELOGIN_LINK_WAIT_MS = "8000";
+
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  const weixinServer = buildLoginCommandWeixinServer(receivedWeixinRequests, "user-1");
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = await startGrokAppServerMock(() => ({ content: "should not be called" }));
+
+  // Simulate the oauth manager: once the bridge drops the relogin marker (as
+  // /login does), publish a fresh login prompt like `oauth.ts relogin` would.
+  const oauthSim = setInterval(() => {
+    if (fs.existsSync(marker)) {
+      fs.writeFileSync(pendingFile, JSON.stringify({ message: `🔐 请登录\n${loginLink}`, updatedAt: 1 }));
+    }
+  }, 50);
+
+  const bridge = new Bridge({
+    appServerUrl: appServer.url,
+    appServerToken: "grok-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: weixinBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() => receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage"));
+  } finally {
+    clearInterval(oauthSim);
+    restoreEnv("GROK_RELOGIN_MARKER", prev.marker);
+    restoreEnv("GROK_PENDING_LOGIN_FILE", prev.pending);
+    restoreEnv("GROK_RELOGIN_LINK_WAIT_MS", prev.wait);
+    await bridge.stop();
+    await appServer.close();
+    weixinServer.close();
+    await bridgeTask;
+  }
+
+  const sendMessageRequest = receivedWeixinRequests.find((request) => request.endpoint === "ilink/bot/sendmessage");
+  const sentText =
+    (sendMessageRequest?.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined)
+      ?.item_list?.[0]?.text_item?.text ?? "";
+  assert.match(sentText, /accounts\.x\.ai\/oauth2\/device\?user_code=NEW-CODE/);
+  // /login must not run a grok turn.
+  assert.equal(appServer.requests.length, 0);
+});
+
+test("bridge ignores /login from a non-operator", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-weixin-bridge-"));
+  const marker = path.join(stateDir, "relogin-request");
+  // Operator is someone else, so /login from user-1 must be ignored.
+  fs.writeFileSync(
+    path.join(stateDir, "weixin-account.json"),
+    JSON.stringify({
+      accountId: "bot",
+      token: "weixin-token",
+      baseUrl: "placeholder",
+      userId: "operator-99",
+      savedAt: "t",
+    }),
+  );
+  const prevMarker = process.env.GROK_RELOGIN_MARKER;
+  process.env.GROK_RELOGIN_MARKER = marker;
+
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  const weixinServer = buildLoginCommandWeixinServer(receivedWeixinRequests, "user-1");
+  const weixinBaseUrl = await listen(weixinServer);
+  // Point the stored account at the test server so getUpdates still reaches it.
+  fs.writeFileSync(
+    path.join(stateDir, "weixin-account.json"),
+    JSON.stringify({
+      accountId: "bot",
+      token: "weixin-token",
+      baseUrl: weixinBaseUrl,
+      userId: "operator-99",
+      savedAt: "t",
+    }),
+  );
+  const appServer = await startGrokAppServerMock(() => ({ content: "should not be called" }));
+
+  const bridge = new Bridge({
+    appServerUrl: appServer.url,
+    appServerToken: "grok-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: weixinBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    // Wait until the bridge has polled again (i.e. processed and dropped /login).
+    await waitFor(
+      () => receivedWeixinRequests.filter((request) => request.endpoint === "ilink/bot/getupdates").length >= 2,
+    );
+  } finally {
+    restoreEnv("GROK_RELOGIN_MARKER", prevMarker);
+    await bridge.stop();
+    await appServer.close();
+    weixinServer.close();
+    await bridgeTask;
+  }
+
+  assert.equal(fs.existsSync(marker), false);
+  assert.equal(
+    receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage"),
+    false,
+  );
+  assert.equal(appServer.requests.length, 0);
+});
+
+function restoreEnv(key: string, previous: string | undefined): void {
+  if (previous === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = previous;
+  }
+}
+
 function listen(server: http.Server): Promise<string> {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
