@@ -942,7 +942,7 @@ test("bridge falls back from upload_full_url to upload_param when Weixin CDN rej
   assert.deepEqual(uploadPaths, ["/full-upload", "/full-upload", "/full-upload", "/upload"]);
 });
 
-test("bridge sends a billing failure message when a Codex turn fails with payment error", async () => {
+test("bridge shows the house billing notice for a billing failure when GROK_BILLING_NOTICE is on", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
   const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
   let getUpdatesCount = 0;
@@ -997,7 +997,9 @@ test("bridge sends a billing failure message when a Codex turn fails with paymen
   }));
   const appServerUrl = appServer.url;
   const previousRechargeTarget = process.env.RECHARGE_TARGET;
+  const previousBillingNotice = process.env.GROK_BILLING_NOTICE;
   process.env.RECHARGE_TARGET = "clawfather";
+  process.env.GROK_BILLING_NOTICE = "1";
   const bridge = new Bridge({
     appServerUrl,
     appServerToken: "codex-token",
@@ -1022,6 +1024,11 @@ test("bridge sends a billing failure message when a Codex turn fails with paymen
     } else {
       process.env.RECHARGE_TARGET = previousRechargeTarget;
     }
+    if (previousBillingNotice === undefined) {
+      delete process.env.GROK_BILLING_NOTICE;
+    } else {
+      process.env.GROK_BILLING_NOTICE = previousBillingNotice;
+    }
     await bridge.stop();
     await appServer.close();
     weixinServer.close();
@@ -1035,6 +1042,103 @@ test("bridge sends a billing failure message when a Codex turn fails with paymen
   assert.equal(sentMessage?.to_user_id, "user-1");
   assert.match(sentMessage?.item_list?.[0]?.text_item?.text ?? "", /模型余额不足/);
   assert.match(sentMessage?.item_list?.[0]?.text_item?.text ?? "", /https:\/\/www\.xialiao\.app\/recharge\/clawfather/);
+});
+
+test("bridge surfaces the upstream provider error directly when GROK_BILLING_NOTICE is off", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-weixin-bridge-"));
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  let getUpdatesCount = 0;
+
+  const weixinServer = http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      receivedWeixinRequests.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(
+            JSON.stringify({
+              ret: 0,
+              get_updates_buf: "buf-1",
+              msgs: [
+                {
+                  message_id: "msg-1",
+                  from_user_id: "user-1",
+                  context_token: "ctx-1",
+                  item_list: [{ type: 1, text_item: { text: "hello" } }],
+                },
+              ],
+            }),
+          );
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = await startGrokAppServerMock(() => ({
+    status: 402,
+    message: "You have run out of credits. Add credits at https://grok.com/?_s=usage",
+  }));
+  const appServerUrl = appServer.url;
+  const previousBillingNotice = process.env.GROK_BILLING_NOTICE;
+  delete process.env.GROK_BILLING_NOTICE;
+  const bridge = new Bridge({
+    appServerUrl,
+    appServerToken: "grok-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: weixinBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() => receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage"));
+  } finally {
+    if (previousBillingNotice === undefined) {
+      delete process.env.GROK_BILLING_NOTICE;
+    } else {
+      process.env.GROK_BILLING_NOTICE = previousBillingNotice;
+    }
+    await bridge.stop();
+    await appServer.close();
+    weixinServer.close();
+    await bridgeTask;
+  }
+
+  const sendMessageRequest = receivedWeixinRequests.find((request) => request.endpoint === "ilink/bot/sendmessage");
+  const sentText =
+    (sendMessageRequest?.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined)
+      ?.item_list?.[0]?.text_item?.text ?? "";
+  assert.match(sentText, /run out of credits/);
+  assert.match(sentText, /grok\.com/);
+  assert.doesNotMatch(sentText, /模型余额不足/);
+  assert.doesNotMatch(sentText, /xialiao\.app\/recharge/);
+  assert.doesNotMatch(sentText, /grok app-server/);
 });
 
 test("bridge relays the pending login link when the app-server has no credential", async () => {

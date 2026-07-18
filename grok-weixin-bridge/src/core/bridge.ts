@@ -383,10 +383,6 @@ function isApiError(resp: { ret?: number; errcode?: number }): boolean {
 
 function formatGrokFailureMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  if (isBillingFailure(message)) {
-    const rechargeUrl = resolveRechargeUrl();
-    return rechargeUrl ? `${BILLING_ERROR_MESSAGE}\n${rechargeUrl}` : BILLING_ERROR_MESSAGE;
-  }
   if (isNoCredentialFailure(message)) {
     // The cloud agent hasn't finished its xAI device login yet. Weixin refuses a
     // proactive push to a user who hasn't messaged the bot ("prepare failed"), so
@@ -395,7 +391,26 @@ function formatGrokFailureMessage(error: unknown): string {
     const pending = readPendingLoginMessage();
     return pending ?? "⏳ 云端 Grok 正在登录中，请稍后再发一条消息获取授权链接。";
   }
-  return `⚠️ Grok 对话失败：${message.slice(0, 500)}`;
+  // Opt-in house billing notice: when GROK_BILLING_NOTICE is enabled, map billing
+  // failures to a custom message + recharge link (for pooled-credit setups). Off
+  // by default — grok operators log in with their own xAI account, so we surface
+  // the provider's own error (e.g. "out of credits — add credits at grok.com").
+  if (useHouseBillingNotice() && isBillingFailure(message)) {
+    const rechargeUrl = resolveRechargeUrl();
+    return rechargeUrl ? `${BILLING_ERROR_MESSAGE}\n${rechargeUrl}` : BILLING_ERROR_MESSAGE;
+  }
+  // Default: surface the upstream provider error directly; strip our
+  // "grok app-server <status>:" transport prefix so only that message shows.
+  return `⚠️ ${stripAppServerPrefix(message).slice(0, 500)}`;
+}
+
+function useHouseBillingNotice(): boolean {
+  const value = (process.env.GROK_BILLING_NOTICE ?? "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on" || value === "house";
+}
+
+function stripAppServerPrefix(message: string): string {
+  return message.replace(/^grok app-server \d+:\s*/iu, "").trim() || message;
 }
 
 function isNoCredentialFailure(message: string): boolean {
