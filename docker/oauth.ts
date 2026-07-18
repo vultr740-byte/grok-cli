@@ -1,0 +1,220 @@
+// Headless OIDC credential manager for the Railway deployment.
+//
+// Keeps a valid xAI access token available without any static API key:
+//   - refreshes an existing refresh_token when possible (hands-off, ~every 6h);
+//   - when there is no usable refresh_token, runs the OAuth 2.0 Device
+//     Authorization flow and delivers the login link to the operator over
+//     Telegram (the channel already wired up), then polls until approved.
+//
+// Usage (called by docker/entrypoint.sh):
+//   bun docker/oauth.ts token
+//     → ensures a valid token and prints "<access_token>\t<expires_at_epoch>"
+//       to stdout. All human-facing progress goes to stderr; secrets are only
+//       persisted to the store file, never logged.
+//
+// It touches no grok-dev source: the entrypoint exports the printed token as
+// GROK_API_KEY for the bridge subprocess.
+
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const CLIENT_ID = process.env.GROK_OIDC_CLIENT_ID ?? "b1a00492-073a-47ea-816f-4c329264a828";
+const DEVICE_ENDPOINT = process.env.GROK_OIDC_DEVICE_ENDPOINT ?? "https://auth.x.ai/oauth2/device/code";
+const TOKEN_ENDPOINT = process.env.GROK_OIDC_TOKEN_ENDPOINT ?? "https://auth.x.ai/oauth2/token";
+const SCOPE = process.env.GROK_OIDC_SCOPE ?? "openid profile email offline_access grok-cli:access api:access";
+const STORE = process.env.GROK_OAUTH_STORE ?? path.join(os.homedir(), ".grok", "oauth.json");
+const SEED_REFRESH_TOKEN = process.env.GROK_OAUTH_REFRESH_TOKEN ?? "";
+
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
+const TG_APPROVED = (process.env.TELEGRAM_APPROVED_USER_IDS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+interface Stored {
+  access_token?: string;
+  refresh_token?: string;
+  expires_at?: number; // epoch seconds
+  obtained_at?: number;
+}
+
+interface TokenResponse {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  error?: string;
+  error_description?: string;
+}
+
+function log(msg: string): void {
+  process.stderr.write(`[oauth] ${msg}\n`);
+}
+
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function loadStore(): Stored {
+  try {
+    return JSON.parse(fs.readFileSync(STORE, "utf8")) as Stored;
+  } catch {
+    return {};
+  }
+}
+
+function saveStore(s: Stored): void {
+  fs.mkdirSync(path.dirname(STORE), { recursive: true });
+  fs.writeFileSync(STORE, JSON.stringify(s, null, 2), { mode: 0o600 });
+}
+
+async function form(endpoint: string, body: Record<string, string>): Promise<TokenResponse> {
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(body).toString(),
+  });
+  return (await res.json()) as TokenResponse;
+}
+
+async function notifyTelegram(text: string): Promise<void> {
+  if (!TG_TOKEN || TG_APPROVED.length === 0) {
+    log("no Telegram target configured; login link will only appear in logs");
+    return;
+  }
+  for (const chatId of TG_APPROVED) {
+    try {
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: false }),
+      });
+    } catch (err) {
+      log(`Telegram notify failed for ${chatId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+function persistFromResponse(resp: TokenResponse, prevRefresh?: string): Stored {
+  const stored: Stored = {
+    access_token: resp.access_token,
+    // Providers may or may not rotate the refresh_token on each grant; keep the
+    // newest one we were handed, else fall back to the one we already had.
+    refresh_token: resp.refresh_token ?? prevRefresh,
+    expires_at: nowSec() + (resp.expires_in ?? 3600),
+    obtained_at: nowSec(),
+  };
+  saveStore(stored);
+  return stored;
+}
+
+async function tryRefresh(refreshToken: string): Promise<Stored | "invalid" | "retry"> {
+  const resp = await form(TOKEN_ENDPOINT, {
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: CLIENT_ID,
+  });
+  if (resp.access_token) {
+    log("refreshed access token");
+    return persistFromResponse(resp, refreshToken);
+  }
+  if (resp.error === "invalid_grant" || resp.error === "invalid_request") {
+    log(`refresh_token no longer valid (${resp.error}); re-authentication required`);
+    return "invalid";
+  }
+  log(`refresh transient error: ${resp.error ?? "unknown"} ${resp.error_description ?? ""}`);
+  return "retry";
+}
+
+async function deviceBootstrap(): Promise<Stored> {
+  // Up to a few device-code issuances in case the operator misses the window.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const dev = (await form(DEVICE_ENDPOINT, { client_id: CLIENT_ID, scope: SCOPE })) as TokenResponse & {
+      device_code?: string;
+      user_code?: string;
+      verification_uri?: string;
+      verification_uri_complete?: string;
+      interval?: number;
+      expires_in?: number;
+    };
+    if (!dev.device_code || !dev.user_code) {
+      throw new Error(`device authorization failed: ${dev.error ?? JSON.stringify(dev)}`);
+    }
+    const link = dev.verification_uri_complete ?? dev.verification_uri ?? "";
+    const minutes = Math.round((dev.expires_in ?? 1800) / 60);
+    log(`device code issued: ${dev.user_code} (attempt ${attempt}) — ${link}`);
+    await notifyTelegram(
+      `🔐 Grok 云端需要登录\n点击链接登录并批准（验证码 ${dev.user_code}），${minutes} 分钟内有效：\n${link}`,
+    );
+
+    let interval = (dev.interval ?? 5) * 1000;
+    const deadline = nowSec() + (dev.expires_in ?? 1800);
+    while (nowSec() < deadline) {
+      await new Promise((r) => setTimeout(r, interval));
+      const resp = await form(TOKEN_ENDPOINT, {
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+        device_code: dev.device_code,
+        client_id: CLIENT_ID,
+      });
+      if (resp.access_token) {
+        log("device authorization approved");
+        await notifyTelegram("✅ 登录成功，云端 Grok 已恢复。");
+        return persistFromResponse(resp);
+      }
+      if (resp.error === "authorization_pending") continue;
+      if (resp.error === "slow_down") {
+        interval += 5000;
+        continue;
+      }
+      if (resp.error === "expired_token") {
+        log("device code expired before approval; reissuing");
+        break; // reissue via outer loop
+      }
+      throw new Error(`device token exchange failed: ${resp.error ?? "unknown"} ${resp.error_description ?? ""}`);
+    }
+  }
+  throw new Error("device authorization not completed after several attempts");
+}
+
+async function ensureToken(): Promise<Stored> {
+  const store = loadStore();
+  const refreshToken = store.refresh_token || SEED_REFRESH_TOKEN;
+
+  // Still-valid access token with comfortable margin → use as-is.
+  if (store.access_token && store.expires_at && store.expires_at - nowSec() > 300) {
+    return store;
+  }
+
+  if (refreshToken) {
+    const result = await tryRefresh(refreshToken);
+    if (result === "retry") {
+      // Transient: if we still hold a non-expired token, keep serving it.
+      if (store.access_token && store.expires_at && store.expires_at > nowSec()) return store;
+      throw new Error("token refresh failed transiently and no valid token cached");
+    }
+    if (result !== "invalid") return result;
+    // else fall through to device bootstrap
+  }
+
+  return deviceBootstrap();
+}
+
+async function main(): Promise<void> {
+  const cmd = process.argv[2] ?? "token";
+  if (cmd !== "token") {
+    log(`unknown command: ${cmd}`);
+    process.exit(2);
+  }
+  const store = await ensureToken();
+  if (!store.access_token || !store.expires_at) {
+    log("failed to obtain access token");
+    process.exit(1);
+  }
+  // Only the token line goes to stdout.
+  process.stdout.write(`${store.access_token}\t${store.expires_at}\n`);
+}
+
+main().catch((err) => {
+  log(`fatal: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});
