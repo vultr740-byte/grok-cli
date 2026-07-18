@@ -99,9 +99,14 @@ APP_PID=$!
 BRIDGE_PID=""
 start_bridge() {
   stop_bridge
+  # GROK_MODEL (optional) selects the model for Telegram chats; the app-server
+  # reads it from the env directly, so this only needs wiring for the bridge.
+  local model_args=()
+  [ -n "${GROK_MODEL:-}" ] && model_args=(--model "$GROK_MODEL")
   GROK_API_KEY="$1" bun run src/index.ts telegram-bridge \
     --no-sandbox \
     -d "$WORKSPACE" \
+    ${model_args[@]+"${model_args[@]}"} \
     --log-file "$GROK_DIR/telegram-remote-bridge.log" \
     --pair-code-file "$GROK_DIR/telegram-pair-code.txt" &
   BRIDGE_PID=$!
