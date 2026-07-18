@@ -3,8 +3,9 @@
 // Keeps a valid xAI access token available without any static API key:
 //   - refreshes an existing refresh_token when possible (hands-off, ~every 6h);
 //   - when there is no usable refresh_token, runs the OAuth 2.0 Device
-//     Authorization flow and delivers the login link to the operator over
-//     Telegram (the channel already wired up), then polls until approved.
+//     Authorization flow and delivers the login link to the operator over the
+//     active channel — Telegram, or Weixin once the account is linked (with a
+//     log fallback) — then polls until approved.
 //
 // Usage (called by docker/entrypoint.sh):
 //   bun docker/oauth.ts token
@@ -25,6 +26,12 @@ const TOKEN_ENDPOINT = process.env.GROK_OIDC_TOKEN_ENDPOINT ?? "https://auth.x.a
 const SCOPE = process.env.GROK_OIDC_SCOPE ?? "openid profile email offline_access grok-cli:access api:access";
 const STORE = process.env.GROK_OAUTH_STORE ?? path.join(os.homedir(), ".grok", "oauth.json");
 const SEED_REFRESH_TOKEN = process.env.GROK_OAUTH_REFRESH_TOKEN ?? "";
+
+// Which channel delivers the login link: Telegram (approved chat ids known at
+// deploy time) or Weixin (push to the connected operator once the account is
+// linked). Anything else falls back to logs only.
+const CHANNEL = process.env.GROK_ENABLED_CHANNEL ?? "telegram";
+const WEIXIN_STATE_DIR = process.env.GROK_WEIXIN_STATE_DIR ?? "/data/weixin";
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
 const TG_APPROVED = (process.env.TELEGRAM_APPROVED_USER_IDS ?? "")
@@ -106,6 +113,63 @@ async function notifyTelegram(text: string): Promise<boolean> {
   return delivered;
 }
 
+interface WeixinAccount {
+  token?: string;
+  baseUrl?: string;
+  userId?: string | null;
+}
+
+// The Weixin bridge writes the connected account (bot token + operator's ilink
+// user id) here once login ① completes.
+function loadWeixinAccount(): WeixinAccount | null {
+  try {
+    const file = path.join(WEIXIN_STATE_DIR, "weixin-account.json");
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as WeixinAccount;
+    if (!parsed.token || !parsed.baseUrl) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Deliver the login link over Weixin by pushing to the connected operator. This
+// needs the Weixin account linked first (bot token + user id), so it returns
+// false until that happens — the caller keeps the link in the logs and retries
+// on the next poll, delivering as soon as the account appears. Reuses the
+// bridge's exact send path (dynamic import) so the wire protocol never drifts.
+async function notifyWeixin(text: string): Promise<boolean> {
+  const account = loadWeixinAccount();
+  if (!account) {
+    log("Weixin account not linked yet; login link stays in logs until it is");
+    return false;
+  }
+  if (!account.userId) {
+    log("Weixin account linked but operator user id is unknown; login link stays in logs");
+    return false;
+  }
+  try {
+    const { sendTextMessage } = (await import(
+      "../grok-weixin-bridge/src/platforms/weixin/api.js"
+    )) as typeof import("../grok-weixin-bridge/src/platforms/weixin/api.js");
+    await sendTextMessage({
+      baseUrl: account.baseUrl!,
+      token: account.token!,
+      toUserId: account.userId,
+      text,
+    });
+    return true;
+  } catch (err) {
+    log(`Weixin notify failed: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+// Channel-agnostic delivery: Weixin push, Telegram send, or (unknown) logs only.
+async function notify(text: string): Promise<boolean> {
+  if (CHANNEL === "weixin") return notifyWeixin(text);
+  return notifyTelegram(text);
+}
+
 interface TgUpdate {
   update_id: number;
   message?: { from?: { id?: number } };
@@ -174,7 +238,7 @@ async function deviceBootstrap(): Promise<Stored> {
   let linkSentAt = 0;
   const RESEND_COOLDOWN = 60;
   const sendLink = async (text: string): Promise<void> => {
-    if (await notifyTelegram(text)) linkSentAt = nowSec();
+    if (await notify(text)) linkSentAt = nowSec();
   };
 
   // Up to a few device-code issuances in case the operator misses the window.
@@ -194,6 +258,10 @@ async function deviceBootstrap(): Promise<Stored> {
     const minutes = Math.round((dev.expires_in ?? 1800) / 60);
     const loginMessage = `🔐 Grok 云端需要登录\n点击链接登录并批准（验证码 ${dev.user_code}），${minutes} 分钟内有效：\n${link}`;
     log(`device code issued: ${dev.user_code} (attempt ${attempt}) — ${link}`);
+    // Each reissued code is a fresh link. Telegram keeps its cross-attempt
+    // delivery cursor; Weixin re-arms so the new link is (re)delivered once the
+    // account is linked.
+    if (CHANNEL === "weixin") linkSentAt = 0;
     await sendLink(loginMessage);
 
     let interval = (dev.interval ?? 5) * 1000;
@@ -201,15 +269,24 @@ async function deviceBootstrap(): Promise<Stored> {
     while (nowSec() < deadline) {
       await new Promise((r) => setTimeout(r, interval));
 
-      // Reactive login link (option A): the bridge isn't running yet, so if an
-      // approved user messages the bot while we wait for approval, resend the
-      // link (throttled) instead of leaving them in silence.
-      const updates = await telegramGetUpdates(tgOffset);
-      if (updates.length > 0) {
-        tgOffset = updates[updates.length - 1].update_id + 1;
-        if (updates.some(isApprovedSender) && (linkSentAt === 0 || nowSec() - linkSentAt >= RESEND_COOLDOWN)) {
-          log("approved user messaged during login wait; delivering link");
+      if (CHANNEL === "weixin") {
+        // Weixin can only push once the operator links the account, which may
+        // happen after the code is issued. Keep trying (cheap: a file read plus
+        // one send) until the link lands, then stop.
+        if (linkSentAt === 0) {
           await sendLink(loginMessage);
+        }
+      } else {
+        // Reactive login link: the bridge isn't running yet, so if an approved
+        // user messages the bot while we wait for approval, resend the link
+        // (throttled) instead of leaving them in silence.
+        const updates = await telegramGetUpdates(tgOffset);
+        if (updates.length > 0) {
+          tgOffset = updates[updates.length - 1].update_id + 1;
+          if (updates.some(isApprovedSender) && (linkSentAt === 0 || nowSec() - linkSentAt >= RESEND_COOLDOWN)) {
+            log("approved user messaged during login wait; delivering link");
+            await sendLink(loginMessage);
+          }
         }
       }
 
@@ -220,7 +297,7 @@ async function deviceBootstrap(): Promise<Stored> {
       });
       if (resp.access_token) {
         log("device authorization approved");
-        await notifyTelegram("✅ 登录成功，云端 Grok 已恢复。");
+        await notify("✅ 登录成功，云端 Grok 已恢复。");
         return persistFromResponse(resp);
       }
       if (resp.error === "authorization_pending") continue;
