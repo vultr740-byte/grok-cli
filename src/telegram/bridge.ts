@@ -4,6 +4,7 @@ import type { ToolCall, ToolResult } from "../types/index";
 import { loadUserSettings, resolveTelegramStreamSettings } from "../utils/settings";
 import { getTelegramAudioSource, transcribeTelegramAudioMessage } from "./audio-input";
 import { splitTelegramMessage, TELEGRAM_MAX_MESSAGE } from "./limits";
+import { isTelegramHtmlParseError, mdToTelegramHtml, splitTelegramHtml, telegramHtmlToPlain } from "./markdown";
 import { registerPairingCode } from "./pairing";
 import { runTelegramPartialReply } from "./preview-stream";
 import { sendFileToTelegram } from "./send-file";
@@ -136,9 +137,15 @@ export function createTelegramBridge(opts: TelegramBridgeOptions): TelegramBridg
           }
           const trimmed = acc.trim() || "(no text output)";
           opts.onAssistantMessage?.({ turnKey, userId, content: trimmed, done: true });
-          const parts = splitTelegramMessage(trimmed);
+          const parts = splitTelegramHtml(mdToTelegramHtml(trimmed));
+          const threadId = ctx.message.message_thread_id;
           for (const part of parts) {
-            await ctx.reply(part);
+            try {
+              await bot.api.sendMessage(ctx.chat.id, part, { parse_mode: "HTML", message_thread_id: threadId });
+            } catch (err) {
+              if (!isTelegramHtmlParseError(err)) throw err;
+              await bot.api.sendMessage(ctx.chat.id, telegramHtmlToPlain(part), { message_thread_id: threadId });
+            }
           }
           return;
         }

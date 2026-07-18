@@ -2,6 +2,7 @@ import type { Api } from "grammy";
 import { GrammyError } from "grammy";
 import type { StreamChunk } from "../types/index";
 import { splitTelegramMessage, TELEGRAM_MAX_MESSAGE } from "./limits";
+import { isTelegramHtmlParseError, mdToTelegramHtml, splitTelegramHtml, telegramHtmlToPlain } from "./markdown";
 import { startTypingRefresh } from "./typing-refresh";
 
 const EDIT_THROTTLE_MS = 350;
@@ -74,6 +75,40 @@ export async function runTelegramPartialReply(api: Api, args: TelegramPartialRep
   const sendParts = async (parts: string[]) => {
     for (const part of parts) {
       await withRetry(() => api.sendMessage(chatId, part, { message_thread_id: messageThreadId }));
+    }
+  };
+
+  // Final assistant text is markdown; render it as Telegram HTML, falling back
+  // to plain text if Telegram rejects the entities so a message is never lost.
+  const sendHtmlParts = async (parts: string[]) => {
+    for (const part of parts) {
+      try {
+        await withRetry(() =>
+          api.sendMessage(chatId, part, { parse_mode: "HTML", message_thread_id: messageThreadId } as never),
+        );
+      } catch (e) {
+        if (!isTelegramHtmlParseError(e)) throw e;
+        await withRetry(() =>
+          api.sendMessage(chatId, telegramHtmlToPlain(part), { message_thread_id: messageThreadId }),
+        );
+      }
+    }
+  };
+
+  const editHtml = async (messageId: number, part: string): Promise<void> => {
+    try {
+      await withRetry(() =>
+        api.editMessageText(chatId, messageId, part, {
+          parse_mode: "HTML",
+          ...editThreadOpts(messageThreadId),
+        } as never),
+      );
+    } catch (e) {
+      if (isMessageNotModified(e)) return;
+      if (!isTelegramHtmlParseError(e)) throw e;
+      await withRetry(() =>
+        api.editMessageText(chatId, messageId, telegramHtmlToPlain(part), editThreadOpts(messageThreadId) as never),
+      );
     }
   };
 
@@ -171,11 +206,11 @@ export async function runTelegramPartialReply(api: Api, args: TelegramPartialRep
     await flushEdit(true);
 
     const trimmed = acc.trim() || "(no text output)";
-    const parts = splitTelegramMessage(trimmed);
+    const parts = splitTelegramHtml(mdToTelegramHtml(trimmed));
     onAssistantMessage?.({ content: trimmed, done: true });
 
     if (previewMessageId === undefined) {
-      await sendParts(parts);
+      await sendHtmlParts(parts);
       return;
     }
 
@@ -190,21 +225,13 @@ export async function runTelegramPartialReply(api: Api, args: TelegramPartialRep
     }
 
     if (previewBroken) {
-      await sendParts(parts);
+      await sendHtmlParts(parts);
       return;
     }
 
-    const messageId = previewMessageId;
-    try {
-      await withRetry(() => api.editMessageText(chatId, messageId, parts[0], editThreadOpts(messageThreadId) as never));
-    } catch (e) {
-      if (!isMessageNotModified(e)) {
-        await sendParts(parts);
-        return;
-      }
-    }
+    await editHtml(previewMessageId, parts[0]);
     if (parts.length > 1) {
-      await sendParts(parts.slice(1));
+      await sendHtmlParts(parts.slice(1));
     }
   } finally {
     stopTyping();
