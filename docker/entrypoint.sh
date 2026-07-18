@@ -25,10 +25,12 @@ chmod 600 "$SETTINGS"
 echo "[entrypoint] settings ready at $SETTINGS"
 echo "[entrypoint] approved users: $(jq -c '.telegram.approvedUserIds // []' "$SETTINGS")"
 
-# --- Health server first, so Railway's healthcheck is green even while an
-#     interactive device login is still pending. ---
-bun run docker/health.ts &
-HEALTH_PID=$!
+# --- App-server first (serves /healthz + the OpenAI-compatible API on $PORT),
+#     so Railway's healthcheck is green even while an interactive device login
+#     is still pending. It reads the credential dynamically (from the OAuth
+#     store), so it never needs restarting when the token rotates. ---
+bun run docker/app-server.ts &
+APP_PID=$!
 
 BRIDGE_PID=""
 start_bridge() {
@@ -50,7 +52,7 @@ stop_bridge() {
 cleanup() {
   trap - EXIT INT TERM
   stop_bridge
-  kill "$HEALTH_PID" 2>/dev/null || true
+  kill "$APP_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -91,9 +93,9 @@ else
   if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && { [ -n "${GROK_API_KEY:-}" ] || jq -e '.apiKey' "$SETTINGS" >/dev/null 2>&1; }; then
     echo "[entrypoint] static mode — starting telegram bridge (workspace: $WORKSPACE)"
     start_bridge "${GROK_API_KEY:-}"
-    wait -n "$HEALTH_PID" "$BRIDGE_PID"
+    wait -n "$APP_PID" "$BRIDGE_PID"
   else
     echo "[entrypoint] TELEGRAM_BOT_TOKEN and/or GROK_API_KEY not set — health server only"
-    wait "$HEALTH_PID"
+    wait "$APP_PID"
   fi
 fi
