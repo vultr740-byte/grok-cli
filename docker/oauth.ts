@@ -77,22 +77,33 @@ async function form(endpoint: string, body: Record<string, string>): Promise<Tok
   return (await res.json()) as TokenResponse;
 }
 
-async function notifyTelegram(text: string): Promise<void> {
+// Returns true if the message was delivered to at least one approved user. A
+// bot cannot message a user before they have started the chat, so a boot-time
+// send often fails (ok:false) until the user hits /start.
+async function notifyTelegram(text: string): Promise<boolean> {
   if (!TG_TOKEN || TG_APPROVED.length === 0) {
     log("no Telegram target configured; login link will only appear in logs");
-    return;
+    return false;
   }
+  let delivered = false;
   for (const chatId of TG_APPROVED) {
     try {
-      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: false }),
       });
+      const data = (await res.json()) as { ok?: boolean; description?: string };
+      if (data.ok) {
+        delivered = true;
+      } else {
+        log(`Telegram send to ${chatId} not delivered: ${data.description ?? "unknown"}`);
+      }
     } catch (err) {
       log(`Telegram notify failed for ${chatId}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  return delivered;
 }
 
 interface TgUpdate {
@@ -153,10 +164,18 @@ async function tryRefresh(refreshToken: string): Promise<Stored | "invalid" | "r
 }
 
 async function deviceBootstrap(): Promise<Stored> {
-  // Telegram poll cursor + resend throttle, kept across device-code re-issues so
-  // we never re-process the same message or spam the operator.
+  // Telegram poll cursor, kept across device-code re-issues so we never
+  // re-process the same message.
   let tgOffset: number | undefined;
-  let lastResendAt = 0;
+  // Last time the login link was actually delivered (0 = never). A bot can't
+  // message a user before they hit /start, so the boot push may not land and
+  // the user's first message is what delivers the link — tracking delivery
+  // avoids sending a second copy right after /start.
+  let linkSentAt = 0;
+  const RESEND_COOLDOWN = 60;
+  const sendLink = async (text: string): Promise<void> => {
+    if (await notifyTelegram(text)) linkSentAt = nowSec();
+  };
 
   // Up to a few device-code issuances in case the operator misses the window.
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -175,7 +194,7 @@ async function deviceBootstrap(): Promise<Stored> {
     const minutes = Math.round((dev.expires_in ?? 1800) / 60);
     const loginMessage = `🔐 Grok 云端需要登录\n点击链接登录并批准（验证码 ${dev.user_code}），${minutes} 分钟内有效：\n${link}`;
     log(`device code issued: ${dev.user_code} (attempt ${attempt}) — ${link}`);
-    await notifyTelegram(loginMessage);
+    await sendLink(loginMessage);
 
     let interval = (dev.interval ?? 5) * 1000;
     const deadline = nowSec() + (dev.expires_in ?? 1800);
@@ -188,10 +207,9 @@ async function deviceBootstrap(): Promise<Stored> {
       const updates = await telegramGetUpdates(tgOffset);
       if (updates.length > 0) {
         tgOffset = updates[updates.length - 1].update_id + 1;
-        if (updates.some(isApprovedSender) && nowSec() - lastResendAt >= 10) {
-          lastResendAt = nowSec();
-          log("approved user messaged during login wait; resending link");
-          await notifyTelegram(`还没完成登录，点下面的链接授权即可 👇\n${loginMessage}`);
+        if (updates.some(isApprovedSender) && (linkSentAt === 0 || nowSec() - linkSentAt >= RESEND_COOLDOWN)) {
+          log("approved user messaged during login wait; delivering link");
+          await sendLink(loginMessage);
         }
       }
 
