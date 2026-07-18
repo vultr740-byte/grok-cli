@@ -1037,6 +1037,106 @@ test("bridge sends a billing failure message when a Codex turn fails with paymen
   assert.match(sentMessage?.item_list?.[0]?.text_item?.text ?? "", /https:\/\/www\.xialiao\.app\/recharge\/clawfather/);
 });
 
+test("bridge relays the pending login link when the app-server has no credential", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-weixin-bridge-"));
+  const pendingFile = path.join(stateDir, "pending-login.json");
+  const loginLink = "https://accounts.x.ai/oauth2/device?user_code=TEST-CODE";
+  fs.writeFileSync(pendingFile, JSON.stringify({ message: `🔐 Grok 云端需要登录\n${loginLink}`, updatedAt: 1 }));
+  const previousPendingFile = process.env.GROK_PENDING_LOGIN_FILE;
+  process.env.GROK_PENDING_LOGIN_FILE = pendingFile;
+
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  let getUpdatesCount = 0;
+
+  const weixinServer = http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      receivedWeixinRequests.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(
+            JSON.stringify({
+              ret: 0,
+              get_updates_buf: "buf-1",
+              msgs: [
+                {
+                  message_id: "msg-1",
+                  from_user_id: "user-1",
+                  context_token: "ctx-1",
+                  item_list: [{ type: 1, text_item: { text: "hello" } }],
+                },
+              ],
+            }),
+          );
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = await startGrokAppServerMock(() => ({
+    status: 503,
+    message: "No xAI credential available",
+  }));
+  const appServerUrl = appServer.url;
+  const bridge = new Bridge({
+    appServerUrl,
+    appServerToken: "grok-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: weixinBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() => receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage"));
+  } finally {
+    if (previousPendingFile === undefined) {
+      delete process.env.GROK_PENDING_LOGIN_FILE;
+    } else {
+      process.env.GROK_PENDING_LOGIN_FILE = previousPendingFile;
+    }
+    await bridge.stop();
+    await appServer.close();
+    weixinServer.close();
+    await bridgeTask;
+  }
+
+  const sendMessageRequest = receivedWeixinRequests.find((request) => request.endpoint === "ilink/bot/sendmessage");
+  const sentMessage = sendMessageRequest?.body.msg as
+    | { to_user_id?: string; item_list?: Array<{ text_item?: { text?: string } }> }
+    | undefined;
+  const sentText = sentMessage?.item_list?.[0]?.text_item?.text ?? "";
+  assert.equal(sentMessage?.to_user_id, "user-1");
+  assert.match(sentText, /accounts\.x\.ai\/oauth2\/device\?user_code=TEST-CODE/);
+  assert.doesNotMatch(sentText, /Grok 对话失败/);
+});
+
 function listen(server: http.Server): Promise<string> {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {

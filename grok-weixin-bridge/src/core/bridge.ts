@@ -387,7 +387,32 @@ function formatGrokFailureMessage(error: unknown): string {
     const rechargeUrl = resolveRechargeUrl();
     return rechargeUrl ? `${BILLING_ERROR_MESSAGE}\n${rechargeUrl}` : BILLING_ERROR_MESSAGE;
   }
+  if (isNoCredentialFailure(message)) {
+    // The cloud agent hasn't finished its xAI device login yet. Weixin refuses a
+    // proactive push to a user who hasn't messaged the bot ("prepare failed"), so
+    // answer this incoming message with the pending login link — a reply weixin
+    // allows — instead of a raw error.
+    const pending = readPendingLoginMessage();
+    return pending ?? "⏳ 云端 Grok 正在登录中，请稍后再发一条消息获取授权链接。";
+  }
   return `⚠️ Grok 对话失败：${message.slice(0, 500)}`;
+}
+
+function isNoCredentialFailure(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes("no xai credential") || (normalized.includes("503") && normalized.includes("credential"));
+}
+
+// The oauth manager writes the pending device-login prompt here while it waits
+// for approval; the bridge surfaces it to the first weixin message.
+function readPendingLoginMessage(): string | null {
+  const file = process.env.GROK_PENDING_LOGIN_FILE ?? path.join(process.env.HOME ?? "", ".grok", "pending-login.json");
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { message?: string };
+    return parsed.message?.trim() ? parsed.message : null;
+  } catch {
+    return null;
+  }
 }
 
 function isBillingFailure(message: string): boolean {

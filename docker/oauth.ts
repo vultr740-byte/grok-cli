@@ -25,6 +25,10 @@ const DEVICE_ENDPOINT = process.env.GROK_OIDC_DEVICE_ENDPOINT ?? "https://auth.x
 const TOKEN_ENDPOINT = process.env.GROK_OIDC_TOKEN_ENDPOINT ?? "https://auth.x.ai/oauth2/token";
 const SCOPE = process.env.GROK_OIDC_SCOPE ?? "openid profile email offline_access grok-cli:access api:access";
 const STORE = process.env.GROK_OAUTH_STORE ?? path.join(os.homedir(), ".grok", "oauth.json");
+// While a device login is pending, mirror the login prompt here so the Weixin
+// bridge can answer the operator's first message with the link (Weixin blocks a
+// proactive push before the user has messaged the bot).
+const PENDING_LOGIN_FILE = process.env.GROK_PENDING_LOGIN_FILE ?? path.join(path.dirname(STORE), "pending-login.json");
 const SEED_REFRESH_TOKEN = process.env.GROK_OAUTH_REFRESH_TOKEN ?? "";
 
 // Which channel delivers the login link: Telegram (approved chat ids known at
@@ -73,6 +77,27 @@ function loadStore(): Stored {
 function saveStore(s: Stored): void {
   fs.mkdirSync(path.dirname(STORE), { recursive: true });
   fs.writeFileSync(STORE, JSON.stringify(s, null, 2), { mode: 0o600 });
+}
+
+// Publish/clear the pending login prompt for the Weixin bridge to relay on the
+// operator's next message (see PENDING_LOGIN_FILE).
+function writePendingLogin(message: string): void {
+  try {
+    fs.mkdirSync(path.dirname(PENDING_LOGIN_FILE), { recursive: true });
+    fs.writeFileSync(PENDING_LOGIN_FILE, JSON.stringify({ message, updatedAt: nowSec() }), {
+      mode: 0o600,
+    });
+  } catch {
+    /* best effort; the link still appears in the logs */
+  }
+}
+
+function clearPendingLogin(): void {
+  try {
+    fs.rmSync(PENDING_LOGIN_FILE, { force: true });
+  } catch {
+    /* best effort */
+  }
 }
 
 async function form(endpoint: string, body: Record<string, string>): Promise<TokenResponse> {
@@ -262,6 +287,9 @@ async function deviceBootstrap(): Promise<Stored> {
     // delivery cursor; Weixin re-arms so the new link is (re)delivered once the
     // account is linked.
     if (CHANNEL === "weixin") linkSentAt = 0;
+    // Publish the prompt so the bridge can relay it on the operator's first
+    // message (Weixin rejects a proactive push before the user has messaged).
+    writePendingLogin(loginMessage);
     await sendLink(loginMessage);
 
     let interval = (dev.interval ?? 5) * 1000;
@@ -297,6 +325,7 @@ async function deviceBootstrap(): Promise<Stored> {
       });
       if (resp.access_token) {
         log("device authorization approved");
+        clearPendingLogin();
         await notify("✅ 登录成功，云端 Grok 已恢复。");
         return persistFromResponse(resp);
       }
