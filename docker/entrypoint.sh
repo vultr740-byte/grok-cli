@@ -53,9 +53,14 @@ if [ "$CHANNEL" = "weixin" ]; then
         # /login: the bridge drops this marker to request a fresh device login.
         # Run it non-destructively (it overwrites the store only on approval), one
         # at a time.
-        if [ -f "$RELOGIN_MARKER" ] && { [ -z "$relogin_pid" ] || ! kill -0 "$relogin_pid" 2>/dev/null; }; then
+        if [ -f "$RELOGIN_MARKER" ]; then
           rm -f "$RELOGIN_MARKER"
-          echo "[entrypoint] /login requested — starting a re-login device flow"
+          # Supersede any in-flight relogin (it polls for ~30 min awaiting
+          # approval) with a fresh code, so a repeated /login always yields a new
+          # link instead of stalling behind the previous one. Killing it before
+          # approval is safe — the store is overwritten only on success.
+          [ -n "$relogin_pid" ] && kill "$relogin_pid" 2>/dev/null || true
+          echo "[entrypoint] /login requested — (re)starting a re-login device flow"
           bun docker/oauth.ts relogin &
           relogin_pid=$!
         fi
