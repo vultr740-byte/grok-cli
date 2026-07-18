@@ -95,6 +95,32 @@ async function notifyTelegram(text: string): Promise<void> {
   }
 }
 
+interface TgUpdate {
+  update_id: number;
+  message?: { from?: { id?: number } };
+}
+
+// Read pending bot messages during the login wait. Short timeout so it never
+// stalls the device-code polling cadence. Safe to consume here: the bridge
+// isn't running yet and starts later with drop_pending_updates.
+async function telegramGetUpdates(offset?: number): Promise<TgUpdate[]> {
+  if (!TG_TOKEN) return [];
+  const params = new URLSearchParams({ timeout: "0", allowed_updates: '["message"]' });
+  if (offset !== undefined) params.set("offset", String(offset));
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?${params.toString()}`);
+    const data = (await res.json()) as { ok?: boolean; result?: TgUpdate[] };
+    return data.ok && data.result ? data.result : [];
+  } catch {
+    return [];
+  }
+}
+
+function isApprovedSender(update: TgUpdate): boolean {
+  const id = update.message?.from?.id;
+  return id !== undefined && TG_APPROVED.includes(String(id));
+}
+
 function persistFromResponse(resp: TokenResponse, prevRefresh?: string): Stored {
   const stored: Stored = {
     access_token: resp.access_token,
@@ -127,6 +153,11 @@ async function tryRefresh(refreshToken: string): Promise<Stored | "invalid" | "r
 }
 
 async function deviceBootstrap(): Promise<Stored> {
+  // Telegram poll cursor + resend throttle, kept across device-code re-issues so
+  // we never re-process the same message or spam the operator.
+  let tgOffset: number | undefined;
+  let lastResendAt = 0;
+
   // Up to a few device-code issuances in case the operator misses the window.
   for (let attempt = 1; attempt <= 5; attempt++) {
     const dev = (await form(DEVICE_ENDPOINT, { client_id: CLIENT_ID, scope: SCOPE })) as TokenResponse & {
@@ -142,15 +173,28 @@ async function deviceBootstrap(): Promise<Stored> {
     }
     const link = dev.verification_uri_complete ?? dev.verification_uri ?? "";
     const minutes = Math.round((dev.expires_in ?? 1800) / 60);
+    const loginMessage = `🔐 Grok 云端需要登录\n点击链接登录并批准（验证码 ${dev.user_code}），${minutes} 分钟内有效：\n${link}`;
     log(`device code issued: ${dev.user_code} (attempt ${attempt}) — ${link}`);
-    await notifyTelegram(
-      `🔐 Grok 云端需要登录\n点击链接登录并批准（验证码 ${dev.user_code}），${minutes} 分钟内有效：\n${link}`,
-    );
+    await notifyTelegram(loginMessage);
 
     let interval = (dev.interval ?? 5) * 1000;
     const deadline = nowSec() + (dev.expires_in ?? 1800);
     while (nowSec() < deadline) {
       await new Promise((r) => setTimeout(r, interval));
+
+      // Reactive login link (option A): the bridge isn't running yet, so if an
+      // approved user messages the bot while we wait for approval, resend the
+      // link (throttled) instead of leaving them in silence.
+      const updates = await telegramGetUpdates(tgOffset);
+      if (updates.length > 0) {
+        tgOffset = updates[updates.length - 1].update_id + 1;
+        if (updates.some(isApprovedSender) && nowSec() - lastResendAt >= 10) {
+          lastResendAt = nowSec();
+          log("approved user messaged during login wait; resending link");
+          await notifyTelegram(`还没完成登录，点下面的链接授权即可 👇\n${loginMessage}`);
+        }
+      }
+
       const resp = await form(TOKEN_ENDPOINT, {
         grant_type: "urn:ietf:params:oauth:grant-type:device_code",
         device_code: dev.device_code,
