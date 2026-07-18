@@ -6,3 +6,10 @@
 !tsconfig.json
 !src
 !docker
+
+# Weixin bridge (built into the image for GROK_ENABLED_CHANNEL=weixin). Bun runs
+# its TypeScript directly, so ship source + manifest only — deps are installed in
+# the image and node_modules/dist/test stay out.
+!grok-weixin-bridge/package.json
+!grok-weixin-bridge/tsconfig.json
+!grok-weixin-bridge/src

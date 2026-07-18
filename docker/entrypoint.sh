@@ -4,9 +4,73 @@ set -euo pipefail
 GROK_DIR="${HOME}/.grok"
 SETTINGS="${GROK_DIR}/user-settings.json"
 WORKSPACE="${GROK_WORKSPACE:-/data/workspace}"
-AUTH_MODE="${GROK_AUTH_MODE:-static}"   # static | oauth
+AUTH_MODE="${GROK_AUTH_MODE:-static}"        # static | oauth
+CHANNEL="${GROK_ENABLED_CHANNEL:-telegram}"  # telegram | weixin
 
 mkdir -p "$GROK_DIR" "$WORKSPACE"
+
+# ============================= Weixin channel =============================
+# grok's app-server runs on a loopback port; the Weixin bridge owns the public
+# $PORT (and serves Railway's /healthz). The bridge talks to the app-server over
+# HTTP, and the app-server reads the rotating xAI OAuth token from its store, so
+# a token refresh needs no process restarts. There is no Telegram here — in OAuth
+# mode the device-login link is written to the container logs for the operator to
+# approve (oauth.ts logs it and degrades gracefully with no Telegram target).
+if [ "$CHANNEL" = "weixin" ]; then
+  # The Weixin bridge owns the public $PORT; grok's app-server listens on a
+  # distinct loopback port. $PORT is usually the same value as the app-server's
+  # default (both 8080), so pin the app-server elsewhere and guard against a clash.
+  PUBLIC_PORT="${PORT:-8080}"
+  APP_SERVER_PORT="${GROK_APP_SERVER_PORT:-8090}"
+  if [ "$APP_SERVER_PORT" = "$PUBLIC_PORT" ]; then
+    APP_SERVER_PORT=$((PUBLIC_PORT + 1))
+  fi
+  echo "[entrypoint] Weixin mode — app-server on 127.0.0.1:${APP_SERVER_PORT}, bridge on ${PUBLIC_PORT}"
+
+  PORT="$APP_SERVER_PORT" bun run docker/app-server.ts &
+  APP_PID=$!
+
+  OAUTH_PID=""
+  BRIDGE_PID=""
+  weixin_cleanup() {
+    trap - EXIT INT TERM
+    [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null || true
+    [ -n "$OAUTH_PID" ] && kill "$OAUTH_PID" 2>/dev/null || true
+    kill "$APP_PID" 2>/dev/null || true
+  }
+  trap weixin_cleanup EXIT INT TERM
+
+  if [ "$AUTH_MODE" = "oauth" ]; then
+    # Keep the OAuth store fresh in the background. The first pass runs the device
+    # flow (blocking until the operator approves the logged link); the app-server
+    # reads the store live, so later refreshes never restart anything.
+    (
+      while true; do
+        if ! bun docker/oauth.ts token >/dev/null; then
+          echo "[entrypoint] token acquisition failed; retrying in 30s"
+          sleep 30
+          continue
+        fi
+        sleep 300
+      done
+    ) &
+    OAUTH_PID=$!
+  fi
+
+  # The bridge inherits WEIXIN_BASE_URL / CONTROL_API_TOKEN / GROK_THREAD_MODE /
+  # GROK_WEIXIN_STATE_DIR / WEIXIN_TOKEN / GROK_DEFAULT_CWD from the environment.
+  (
+    cd /app/grok-weixin-bridge \
+      && PORT="$PUBLIC_PORT" \
+         GROK_APP_SERVER_URL="http://127.0.0.1:${APP_SERVER_PORT}" \
+         GROK_APP_SERVER_TOKEN="${GROK_APP_SERVER_TOKEN:-${APP_SERVER_TOKEN:-}}" \
+         bun run src/index.ts
+  ) &
+  BRIDGE_PID=$!
+
+  wait -n "$APP_PID" "$BRIDGE_PID"
+  exit $?
+fi
 
 # --- Merge env-provided Telegram config into user-settings.json (merge, not
 #     overwrite: approvedUserIds / sessionsByUserId are written at runtime). ---
