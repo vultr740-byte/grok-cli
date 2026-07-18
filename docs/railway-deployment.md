@@ -9,9 +9,13 @@
 
 ## 1. 结论先行（TL;DR）
 
-把本仓库（`grok-dev`，Bun/OpenTUI 的第三方 Grok CLI）以 **Telegram 远程遥控桥**的形态部署到了 Railway，验证通过：手机 Telegram → 云端容器里的 agent → 调 xAI → 回到手机。
+把本仓库（`grok-dev`，Bun/OpenTUI 的第三方 Grok CLI）部署到了 Railway，现有**两种驱动方式**并存、共享同一套自刷新的 OAuth 登录：
+- **Telegram 遥控**：手机 → 云端 agent → 调 xAI → 回手机。
+- **HTTP API**（OpenAI 兼容）：任何 SDK/脚本可调，见独立文档 **[`app-server-api.md`](./app-server-api.md)**（外部接入用这份）。
 
-**当前形态是临时 demo**，靠复用本地登录的短命 OAuth 令牌，会在令牌过期后停摆。要长期用需换成长期 `xai-` key（见 §8、§9）。
+> 本文档是**部署方复盘 + runbook**。外部服务只需接 API 的话，直接看 [`app-server-api.md`](./app-server-api.md)。
+
+认证已从"临时复制短命 JWT"演进为 **OAuth device-code 自动登录 + 刷新**（§3、§8），无需静态 key、令牌自动续期。
 
 关键线索链：
 1. 本仓库**没有 HTTP 服务、没有登录**，只有 CLI/TUI + 一个进程内的 Telegram 桥。
