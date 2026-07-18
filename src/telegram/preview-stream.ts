@@ -116,6 +116,7 @@ export async function runTelegramPartialReply(api: Api, args: TelegramPartialRep
   /** First sendMessage failed — finish with sendParts only. */
   let previewCreateFailed = false;
   let acc = "";
+  let errorMessage: string | null = null;
   let previewBroken = false;
   let lastEditAt = 0;
   let lastEditLen = 0;
@@ -181,6 +182,9 @@ export async function runTelegramPartialReply(api: Api, args: TelegramPartialRep
               onToolResult?.({ toolCall: chunk.toolCall, toolResult: chunk.toolResult });
             }
             break;
+          case "error":
+            if (chunk.content) errorMessage = chunk.content;
+            break;
         }
       }
     } catch (err: unknown) {
@@ -204,6 +208,28 @@ export async function runTelegramPartialReply(api: Api, args: TelegramPartialRep
     }
 
     await flushEdit(true);
+
+    // A turn that produced no text but emitted an error (e.g. an out-of-credits
+    // 402) should surface the error, not a silent "(no text output)".
+    if (!acc.trim() && errorMessage) {
+      const errText = `⚠️ ${errorMessage}`;
+      onAssistantMessage?.({ content: errText, done: true });
+      const errParts = splitTelegramMessage(errText);
+      if (previewMessageId !== undefined && !previewBroken && errParts.length > 0) {
+        const messageId = previewMessageId;
+        try {
+          await withRetry(() =>
+            api.editMessageText(chatId, messageId, errParts[0], editThreadOpts(messageThreadId) as never),
+          );
+          if (errParts.length > 1) await sendParts(errParts.slice(1));
+        } catch {
+          await sendParts(errParts);
+        }
+      } else {
+        await sendParts(errParts);
+      }
+      return;
+    }
 
     const trimmed = acc.trim() || "(no text output)";
     const parts = splitTelegramHtml(mdToTelegramHtml(trimmed));

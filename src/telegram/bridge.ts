@@ -102,6 +102,7 @@ export function createTelegramBridge(opts: TelegramBridgeOptions): TelegramBridg
             stream.typingIndicator,
           );
           let acc = "";
+          let errorMessage: string | null = null;
           try {
             for await (const chunk of agent.processMessage(promptText)) {
               switch (chunk.type) {
@@ -126,6 +127,9 @@ export function createTelegramBridge(opts: TelegramBridgeOptions): TelegramBridg
                     });
                   }
                   break;
+                case "error":
+                  if (chunk.content) errorMessage = chunk.content;
+                  break;
               }
             }
           } catch (err: unknown) {
@@ -134,6 +138,17 @@ export function createTelegramBridge(opts: TelegramBridgeOptions): TelegramBridg
             return;
           } finally {
             stopTyping();
+          }
+          // Surface a turn that produced no text but did emit an error (e.g. an
+          // out-of-credits 402), instead of a silent "(no text output)".
+          if (!acc.trim() && errorMessage) {
+            const errText = `⚠️ ${errorMessage}`;
+            opts.onAssistantMessage?.({ turnKey, userId, content: errText, done: true });
+            const errThreadId = ctx.message.message_thread_id;
+            for (const part of splitTelegramMessage(errText)) {
+              await bot.api.sendMessage(ctx.chat.id, part, { message_thread_id: errThreadId });
+            }
+            return;
           }
           const trimmed = acc.trim() || "(no text output)";
           opts.onAssistantMessage?.({ turnKey, userId, content: trimmed, done: true });
