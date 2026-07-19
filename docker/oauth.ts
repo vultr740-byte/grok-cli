@@ -252,7 +252,11 @@ async function tryRefresh(refreshToken: string): Promise<Stored | "invalid" | "r
   return "retry";
 }
 
-async function deviceBootstrap(): Promise<Stored> {
+// reactive: poll Telegram getUpdates to resend the link when an approved user
+// messages during the wait. Enabled for the initial login (the bridge isn't
+// running yet), but DISABLED for /login re-logins — the bridge is running then
+// and would race us for the same getUpdates cursor. The initial push still fires.
+async function deviceBootstrap(reactive: boolean): Promise<Stored> {
   // Telegram poll cursor, kept across device-code re-issues so we never
   // re-process the same message.
   let tgOffset: number | undefined;
@@ -299,7 +303,7 @@ async function deviceBootstrap(): Promise<Stored> {
     while (nowSec() < deadline) {
       await new Promise((r) => setTimeout(r, interval));
 
-      if (CHANNEL !== "weixin") {
+      if (CHANNEL !== "weixin" && reactive) {
         // Reactive login link: if an approved telegram user messages the bot
         // while we wait for approval, resend the link (throttled).
         const updates = await telegramGetUpdates(tgOffset);
@@ -358,7 +362,7 @@ async function ensureToken(): Promise<Stored> {
     // else fall through to device bootstrap
   }
 
-  return deviceBootstrap();
+  return deviceBootstrap(true);
 }
 
 async function main(): Promise<void> {
@@ -369,7 +373,7 @@ async function main(): Promise<void> {
     // successful approval, so the current account keeps serving until then. It
     // publishes the link via pending-login.json for the bridge to relay.
     try {
-      await deviceBootstrap();
+      await deviceBootstrap(false);
       log("relogin: new account authorized (store overwritten)");
     } catch (err) {
       log(`relogin: not completed (${err instanceof Error ? err.message : String(err)}); current account unchanged`);

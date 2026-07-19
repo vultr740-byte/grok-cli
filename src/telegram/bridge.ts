@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Bot } from "grammy";
 import type { Agent } from "../agent/agent";
 import type { ToolCall, ToolResult } from "../types/index";
@@ -240,6 +243,25 @@ export function createTelegramBridge(opts: TelegramBridgeOptions): TelegramBridg
     if (userId === undefined) return;
     const code = registerPairingCode(userId);
     await ctx.reply(`Your pairing code: ${code}\nEnter this code in Grok CLI (/remote-control → Telegram) to approve.`);
+  });
+
+  // /login: switch the cloud agent's xAI account. Drops a marker the entrypoint
+  // watches; it re-runs the device flow non-destructively (the current account
+  // keeps working until a new one is approved) and pushes the fresh login link
+  // over Telegram. Approved users only.
+  bot.command("login", async (ctx) => {
+    const userId = await ensureApprovedUser(ctx);
+    if (userId === null) return;
+    try {
+      const marker = process.env.GROK_RELOGIN_MARKER ?? path.join(os.homedir(), ".grok", "relogin-request");
+      fs.mkdirSync(path.dirname(marker), { recursive: true });
+      fs.writeFileSync(marker, String(Date.now()));
+      await ctx.reply(
+        "🔄 正在生成新的登录链接，稍候会推送给你。用你想切换到的账号打开并批准即可；在你批准前当前账号保持不变。",
+      );
+    } catch (err) {
+      await ctx.reply(`Failed to start re-login: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
 
   bot.on("message:text", async (ctx) => {

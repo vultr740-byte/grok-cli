@@ -152,9 +152,27 @@ if [ "$AUTH_MODE" = "oauth" ]; then
   #     refresh; deliver login links over Telegram. Restart the bridge whenever
   #     the access token rotates (the bridge reads the key at construction). ---
   echo "[entrypoint] OAuth mode — managing credential via device flow + refresh"
+  RELOGIN_MARKER="${GROK_DIR}/relogin-request"
   prev=""
   refresh_at=0
+  relogin_pid=""
   while true; do
+    # /login: the bridge drops this marker to request a fresh device login. Run
+    # it non-destructively (it overwrites the store only on approval, and pushes
+    # the new link over Telegram itself), superseding any in-flight relogin.
+    if [ -f "$RELOGIN_MARKER" ]; then
+      rm -f "$RELOGIN_MARKER"
+      [ -n "$relogin_pid" ] && kill "$relogin_pid" 2>/dev/null || true
+      echo "[entrypoint] /login requested — (re)starting a re-login device flow"
+      bun docker/oauth.ts relogin &
+      relogin_pid=$!
+    fi
+    # When a relogin finishes, re-check the token promptly so the bridge restarts
+    # on a newly-approved account instead of waiting for the next scheduled refresh.
+    if [ -n "$relogin_pid" ] && ! kill -0 "$relogin_pid" 2>/dev/null; then
+      relogin_pid=""
+      refresh_at=0
+    fi
     now="$(date +%s)"
     if [ -z "$prev" ] || [ "$now" -ge "$refresh_at" ]; then
       if line="$(bun docker/oauth.ts token)"; then
@@ -168,8 +186,7 @@ if [ "$AUTH_MODE" = "oauth" ]; then
         fi
       else
         echo "[entrypoint] token acquisition failed; retrying in 30s"
-        sleep 30
-        continue
+        refresh_at=$(( now + 30 ))
       fi
     fi
     # Restart the bridge if it exited on its own.
@@ -177,7 +194,7 @@ if [ "$AUTH_MODE" = "oauth" ]; then
       echo "[entrypoint] bridge exited; restarting"
       start_bridge "$prev"
     fi
-    sleep 60
+    sleep 5
   done
 else
   # --- Static mode: use GROK_API_KEY env / settings.apiKey (original behavior). ---
